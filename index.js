@@ -401,13 +401,74 @@ export default async function handler(req, res) {
       const app = await getDailyHotApp();
       const webReq = toWebRequest(req);
       const webRes = await app.fetch(webReq);
-      await writeWebResponse(webRes, res);
-      return;
+      const statusOk = webRes.status >= 200 && webRes.status < 300;
+
+      // ============================================================
+      // ⭐ 修复：dailyhot-api 自身返回非 2xx（例如 weibo 反爬 403 HTML 页）
+      //   - 旧逻辑：直接把 403 HTML 写给前端，显示"request failed with status code 403"
+      //     但 Vercel Logs 里看起来像 500，误导定位。
+      //   - 新逻辑：统一"包一层"JSON：
+      //       • 把 dailyhot-api 返回的真实 status / content-type / 响应体文本原样输出
+      //       • 如果 JSON 可解析就作为子对象返回，不可解析就放进 responseText 字段
+      //       • 同时 console.error 到 Vercel Functions Logs（这样以后能看到具体 4xx）
+      // ============================================================
+      if (statusOk) {
+        // 2xx 正常：原样透传（最常用的 bilibili/zhihu 等正常走这里，性能最优）
+        await writeWebResponse(webRes, res);
+        return;
+      }
+
+      // ✅ 非 2xx：把真实错误读出来包 JSON 回传 + 写日志（让前端和 Vercel 都能看到真相）
+      let rawBody = "";
+      try {
+        rawBody = webRes.body ? String(await webRes.text()) : "";
+      } catch {
+        rawBody = "";
+      }
+      // 尝试解析 JSON（dailyhot-api 有时也会返回错误 JSON）
+      let innerJson = null;
+      try {
+        if (rawBody && /^\s*[\{\[]/.test(rawBody)) innerJson = JSON.parse(rawBody);
+      } catch {
+        innerJson = null;
+      }
+      // 截取 HTML 错误的前 600 字防止响应过大
+      const snippet =
+        innerJson == null && rawBody.length > 600
+          ? rawBody.slice(0, 600) + "...(truncated)"
+          : rawBody;
+
+      const routeName = (url || "/").split("?")[0].replace(/^\/+/, "") || "index";
+
+      // ⚠️ 打印到 Vercel Functions Logs（红色 ERROR 级别，这样以后一眼能看到真实错误）
+      try {
+        console.error(
+          "[dailyhot-api upstream " + routeName + "] status=" + webRes.status +
+          " contentType=" + (webRes.headers.get("content-type") || "") +
+          " snippet=" + snippet.replace(/\s+/g, " ").slice(0, 500)
+        );
+      } catch (_) {}
+
+      const payload = {
+        code: 502, // 语义：上游服务器返回异常（weibo 403 属于"上游拒绝"）
+        message: "上游接口返回异常：status " + webRes.status,
+        route: routeName,
+        upstreamStatus: webRes.status,
+        upstreamContentType: webRes.headers.get("content-type") || "",
+        upstreamJson: innerJson, // 如果 dailyhot-api 返回的是 JSON error 就在这里
+        upstreamResponseText: snippet, // HTML 或原始文本（weibo 403 页面内容放这里）
+        hint:
+          routeName === "weibo"
+            ? "微博对海外云 IP 反爬严格。解决：① 换一个国内可访问的备用源（m.weibo.cn 等）；② 配置 HTTP 代理；③ 在国内服务器部署后回源"
+            : "上游接口失败，请检查网络或更换数据源",
+      };
+      return sendJson(502, payload);
     } catch (e) {
       return sendJson(500, {
         code: 500,
         message: "内置接口处理失败（dailyhot-api）",
         error: e.message || String(e),
+        stack: e.stack ? String(e.stack).slice(0, 800) : undefined,
       });
     }
   } catch (e) {
