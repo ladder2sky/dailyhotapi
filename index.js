@@ -350,10 +350,27 @@ async function getDailyHotApp() {
     let app = null;
     const tried = [];
 
-    // ---- 方式 A（优先）：createRequire 找到包根，再绝对路径动态 import ----
+    // ---- 先找 dailyhot-api 包根目录（用入口文件反推，避免 exports 限制 ./package.json）----
+    let pkgRoot = null;
     try {
-      const pkgJsonPath = require.resolve("dailyhot-api/package.json");
-      const pkgRoot = path.dirname(pkgJsonPath);
+      // require.resolve("dailyhot-api") 永远返回它 package.json main/exports 里声明的入口文件绝对路径
+      const entryPath = require.resolve("dailyhot-api");
+      // 向上找两层，直到找到包含 package.json 的目录（兼容不同包结构）
+      let cur = path.dirname(entryPath);
+      for (let i = 0; i < 5 && cur && cur !== path.dirname(cur); i++) {
+        if (fs.existsSync(path.join(cur, "package.json"))) {
+          pkgRoot = cur;
+          break;
+        }
+        cur = path.dirname(cur);
+      }
+      tried.push("pkgRoot:" + (pkgRoot || "not-found (entry=" + entryPath + ")"));
+    } catch (e) {
+      tried.push("pkgRoot-err:" + e.message);
+    }
+
+    // ---- 方式 A（推荐）：用绝对路径动态 import app.js（完全绕过 package.json exports 限制）----
+    if (pkgRoot) {
       const candidates = [
         path.join(pkgRoot, "dist", "app.js"),
         path.join(pkgRoot, "src", "app.js"),
@@ -362,39 +379,59 @@ async function getDailyHotApp() {
       for (const abs of candidates) {
         tried.push("A:" + abs);
         if (fs.existsSync(abs)) {
-          const mod = await import(pathToFileURL(abs));
-          app = mod?.default || mod?.app;
-          if (app && typeof app.fetch === "function") break;
+          try {
+            const mod = await import(pathToFileURL(abs));
+            app = mod?.default || mod?.app;
+            if (app && typeof app.fetch === "function") break;
+          } catch (e) {
+            tried.push("A-err:" + e.message);
+          }
         }
       }
-    } catch (e) {
-      tried.push("A-err:" + e.message);
     }
 
-    // ---- 方式 B：常规 ESM 子路径导入（依赖 exports 补丁）----
-    if (!app || typeof app.fetch !== "function") {
-      const subs = [
-        "dailyhot-api/dist/app.js",
-        "dailyhot-api/src/app.js",
-        "dailyhot-api/app.js",
+    // ---- 方式 B：CommonJS require 直接读（完全无视 ESM exports，兜底最稳）----
+    if ((!app || typeof app.fetch !== "function") && pkgRoot) {
+      const cjsCandidates = [
+        path.join(pkgRoot, "dist", "app.js"),
+        path.join(pkgRoot, "src", "app.js"),
+        path.join(pkgRoot, "app.js"),
       ];
-      for (const s of subs) {
-        tried.push("B:" + s);
-        try {
-          const mod = await import(s);
-          app = mod?.default || mod?.app;
-          if (app && typeof app.fetch === "function") break;
-        } catch (_) {}
+      for (const abs of cjsCandidates) {
+        tried.push("B:" + abs);
+        if (fs.existsSync(abs)) {
+          try {
+            // CommonJS require 不受 package.json exports 子路径限制
+            const mod = require(abs);
+            app = mod?.default || mod?.app || mod;
+            if (app && typeof app.fetch === "function") break;
+          } catch (e) {
+            tried.push("B-err:" + e.message);
+          }
+        }
       }
     }
 
-    // ---- 方式 C：包根命名导出 ----
+    // ---- 方式 C：包根命名导出（常规 ESM import，作为最后尝试）----
     if (!app || typeof app.fetch !== "function") {
-      tried.push("C:root");
+      tried.push("C:rootESM");
       try {
         const pkg = await import("dailyhot-api");
-        app = pkg?.app || pkg?.default?.app;
-      } catch (_) {}
+        app = pkg?.app || pkg?.default?.app || pkg?.default;
+      } catch (e) {
+        tried.push("C-err:" + e.message);
+      }
+    }
+
+    // ---- 方式 D：包根 CommonJS require（最兜底）----
+    if (!app || typeof app.fetch !== "function") {
+      tried.push("D:rootCJS");
+      try {
+        const pkg = require("dailyhot-api");
+        app = pkg?.app || pkg?.default?.app || pkg?.default || pkg;
+      } catch (e) {
+        tried.push("D-err:" + e.message);
+      }
     }
 
     if (!app || typeof app.fetch !== "function") {
@@ -403,9 +440,9 @@ async function getDailyHotApp() {
           "❌ 无法加载 dailyhot-api 的内部 Hono app（app.fetch 未找到）。",
           "已尝试: " + tried.join(" | "),
           "",
-          "💡 解决（推荐 A）：",
-          "  A. 直接 Fork 官方仓库 imsyy/DailyHotApi，在 src/routes/ 下加 reddit.ts 和 hackernews.ts（export const handleRoute = ...）",
-          "  B. 确保 Build 时执行了 patch-dailyhot-api.js，Vercel Build Command 设为 npm run vercel-build",
+          "💡 解决：",
+          "  A. 检查 node_modules/dailyhot-api 是否存在，删除 node_modules 后重新 npm install",
+          "  B. 确保 Build 时执行了 patch-dailyhot-api.js，Vercel Build Command = npm run vercel-build",
         ].join("\n")
       );
     }
