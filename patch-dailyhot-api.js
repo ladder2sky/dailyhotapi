@@ -15,16 +15,74 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 
 // ============================================================
-// 修复 1：package.json exports 子路径
+// 修复 1：package.json exports 子路径 + 主入口格式修正
+//   - Node 22 严格要求：exports 目标路径必须以 "./" 开头
+//   - dailyhot-api 官方 npm 包偶尔会写成 "dist/index.js"（缺 ./）
+//     导致 require.resolve / import / require 全部直接抛语法错
 // ============================================================
 try {
-  const pkgJsonPath = require.resolve("dailyhot-api/package.json");
-  const pkgRoot = path.dirname(pkgJsonPath);
+  // 构建期先靠 __dirname 找 node_modules，不经过 Node 解析器，避免原 exports 坏了就死循环
+  let pkgRoot = null;
+  let pkgJsonPath = null;
+  const guesses = [
+    path.join(__dirname, "node_modules", "dailyhot-api", "package.json"),
+    path.join(__dirname, "..", "node_modules", "dailyhot-api", "package.json"),
+  ];
+  for (const g of guesses) {
+    if (fs.existsSync(g)) { pkgJsonPath = g; pkgRoot = path.dirname(g); break; }
+  }
+  // 兜底再用 require.resolve（若原 exports 是坏的这里会抛，没关系）
+  if (!pkgJsonPath) {
+    try { pkgJsonPath = require.resolve("dailyhot-api/package.json"); pkgRoot = path.dirname(pkgJsonPath); } catch (_) {}
+  }
+  if (!pkgJsonPath || !fs.existsSync(pkgJsonPath)) {
+    throw new Error("找不到 dailyhot-api/package.json，已尝试: " + guesses.join(", "));
+  }
+
   const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8"));
 
   let changed = false;
+
+  // 1.1 修正 pkg.main 字段（确保 ./ 开头）
+  if (pkg.main && !pkg.main.startsWith("./")) {
+    console.log(`  ! 修复 main: "${pkg.main}" -> "./${pkg.main}"`);
+    pkg.main = "./" + pkg.main.replace(/^\.\/+/, "");
+    changed = true;
+  }
+
   pkg.exports = pkg.exports || {};
 
+  // 1.2 修复整个 exports 对象里所有不以 "./" 开头的 target 路径
+  //     支持三种写法：字符串 / {import, require, default} / 条件映射对象
+  const normalizeExportTarget = (val, ctxKey) => {
+    if (typeof val === "string") {
+      if (val && !val.startsWith("./") && !val.startsWith("node:") && !val.startsWith("/")) {
+        const fixed = "./" + val.replace(/^\.\/+/, "");
+        console.log(`  ! 修复 exports["${ctxKey}"]: "${val}" -> "${fixed}"`);
+        changed = true;
+        return fixed;
+      }
+      return val;
+    }
+    if (val && typeof val === "object" && !Array.isArray(val)) {
+      const out = {};
+      for (const [ck, cv] of Object.entries(val)) out[ck] = normalizeExportTarget(cv, `${ctxKey}:${ck}`);
+      return out;
+    }
+    return val;
+  };
+  const newExports = {};
+  for (const [k, v] of Object.entries(pkg.exports)) newExports[k] = normalizeExportTarget(v, k);
+  // 确保 exports 的 key 也以 "." 或 "./" 开头（Node 规范）
+  const normalizedKeyExports = {};
+  for (const [k, v] of Object.entries(newExports)) {
+    const nk = (k === "." || k.startsWith("./")) ? k : ("./" + k.replace(/^\.\/+/, ""));
+    if (nk !== k) { console.log(`  ! 修复 exports key: "${k}" -> "${nk}"`); changed = true; }
+    normalizedKeyExports[nk] = v;
+  }
+  pkg.exports = normalizedKeyExports;
+
+  // 1.3 补全子路径 exports（便于调试子路径 import）
   const subExports = {
     "./app": "./dist/app.js",
     "./registry": "./dist/registry.js",
@@ -34,13 +92,14 @@ try {
     "./views/*": "./dist/views/*.js",
     "./robots.txt": "./dist/robots.txt.js",
     "./types": "./dist/types.js",
+    "./package.json": "./package.json",
   };
 
   for (const [key, val] of Object.entries(subExports)) {
     if (!pkg.exports[key]) {
       const candidate = val.replace(/\*/, "index");
       const fullTarget = path.join(pkgRoot, candidate.replace(/^\.\//, ""));
-      if (fs.existsSync(fullTarget) || key.includes("*")) {
+      if (fs.existsSync(fullTarget) || key.includes("*") || key.endsWith("/package.json")) {
         pkg.exports[key] = val;
         changed = true;
         console.log(`  + add exports["${key}"] = "${val}"`);
@@ -48,10 +107,12 @@ try {
     }
   }
 
-  if (!pkg.exports["."]) {
-    const main = pkg.main || "./dist/index.js";
-    pkg.exports["."] = { import: main, require: main };
+  // 1.4 确保主入口 "." 存在且格式合法
+  const mainNorm = pkg.main ? (pkg.main.startsWith("./") ? pkg.main : "./" + pkg.main.replace(/^\.\/+/, "")) : "./dist/index.js";
+  if (!pkg.exports["."] || typeof pkg.exports["."] !== "object" || !pkg.exports["."].import || !pkg.exports["."].require) {
+    pkg.exports["."] = { import: mainNorm, require: mainNorm, default: mainNorm };
     changed = true;
+    console.log(`  + 修复主入口 exports["."] = ${JSON.stringify(pkg.exports["."])}`);
   }
 
   if (changed) {

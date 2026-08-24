@@ -350,26 +350,46 @@ async function getDailyHotApp() {
     let app = null;
     const tried = [];
 
-    // ---- 先找 dailyhot-api 包根目录（用入口文件反推，避免 exports 限制 ./package.json）----
+    // ============================================================
+    // ⚠️ dailyhot-api npm 包的 package.json exports 常写坏（如 "dist/index.js" 缺 "./"）
+    //    Node 22 会把这种 exports 直接当语法错误 → 任何按包名解析都会死。
+    //    因此我们优先走「绝对路径直读文件」，完全跳过 Node 的 exports 解析机制。
+    // ============================================================
+
+    // ---- 先 100% 确定 dailyhot-api 的包根目录（不经过 Node 解析器）----
     let pkgRoot = null;
-    try {
-      // require.resolve("dailyhot-api") 永远返回它 package.json main/exports 里声明的入口文件绝对路径
-      const entryPath = require.resolve("dailyhot-api");
-      // 向上找两层，直到找到包含 package.json 的目录（兼容不同包结构）
-      let cur = path.dirname(entryPath);
-      for (let i = 0; i < 5 && cur && cur !== path.dirname(cur); i++) {
-        if (fs.existsSync(path.join(cur, "package.json"))) {
-          pkgRoot = cur;
-          break;
-        }
-        cur = path.dirname(cur);
+    const pkgRootGuesses = [
+      // Vercel 部署后：/var/task/node_modules/dailyhot-api
+      path.join(__dirname, "node_modules", "dailyhot-api"),
+      // pnpm monorepo 或开发机 hoisted：向上两级找
+      path.join(__dirname, "..", "node_modules", "dailyhot-api"),
+      path.join(__dirname, "..", "..", "node_modules", "dailyhot-api"),
+    ];
+    for (const g of pkgRootGuesses) {
+      if (fs.existsSync(path.join(g, "package.json"))) {
+        pkgRoot = g;
+        break;
       }
-      tried.push("pkgRoot:" + (pkgRoot || "not-found (entry=" + entryPath + ")"));
-    } catch (e) {
-      tried.push("pkgRoot-err:" + e.message);
+    }
+    tried.push("pkgRoot:" + (pkgRoot || "not-found (checked=" + pkgRootGuesses.length + ")"));
+
+    // ---- 兜底再尝试 require.resolve（若构建补丁已生效，exports 修好了就能用）----
+    if (!pkgRoot) {
+      try {
+        const entryPath = require.resolve("dailyhot-api");
+        let cur = path.dirname(entryPath);
+        for (let i = 0; i < 6 && cur && cur !== path.dirname(cur); i++) {
+          if (fs.existsSync(path.join(cur, "package.json"))) { pkgRoot = cur; break; }
+          cur = path.dirname(cur);
+        }
+        tried.push("pkgRoot-fallback:" + (pkgRoot || "fail"));
+      } catch (e) {
+        tried.push("pkgRoot-fallback-err:" + e.message);
+      }
     }
 
-    // ---- 方式 A（推荐）：用绝对路径动态 import app.js（完全绕过 package.json exports 限制）----
+    // ---- 方式 A（首选）：绝对路径动态 import dist/app.js / src/app.js ----
+    //      100% 绕过 package.json exports，只要文件存在就能 load
     if (pkgRoot) {
       const candidates = [
         path.join(pkgRoot, "dist", "app.js"),
@@ -377,7 +397,7 @@ async function getDailyHotApp() {
         path.join(pkgRoot, "app.js"),
       ];
       for (const abs of candidates) {
-        tried.push("A:" + abs);
+        tried.push("A:" + abs + (fs.existsSync(abs) ? "(exists)" : "(missing)"));
         if (fs.existsSync(abs)) {
           try {
             const mod = await import(pathToFileURL(abs));
@@ -390,7 +410,7 @@ async function getDailyHotApp() {
       }
     }
 
-    // ---- 方式 B：CommonJS require 直接读（完全无视 ESM exports，兜底最稳）----
+    // ---- 方式 B：CommonJS require 绝对路径（ESM 加载失败时兜底，对 CJS 模块更稳）----
     if ((!app || typeof app.fetch !== "function") && pkgRoot) {
       const cjsCandidates = [
         path.join(pkgRoot, "dist", "app.js"),
@@ -398,10 +418,9 @@ async function getDailyHotApp() {
         path.join(pkgRoot, "app.js"),
       ];
       for (const abs of cjsCandidates) {
-        tried.push("B:" + abs);
+        tried.push("B:" + abs + (fs.existsSync(abs) ? "(exists)" : "(missing)"));
         if (fs.existsSync(abs)) {
           try {
-            // CommonJS require 不受 package.json exports 子路径限制
             const mod = require(abs);
             app = mod?.default || mod?.app || mod;
             if (app && typeof app.fetch === "function") break;
@@ -412,25 +431,51 @@ async function getDailyHotApp() {
       }
     }
 
-    // ---- 方式 C：包根命名导出（常规 ESM import，作为最后尝试）----
+    // ---- 方式 C：包根 dist/index.js / src/index.js（整包入口文件，再从导出里拿 app）----
+    if ((!app || typeof app.fetch !== "function") && pkgRoot) {
+      const entryCandidates = [
+        path.join(pkgRoot, "dist", "index.js"),
+        path.join(pkgRoot, "src", "index.js"),
+        path.join(pkgRoot, "index.js"),
+      ];
+      for (const abs of entryCandidates) {
+        tried.push("C:" + abs + (fs.existsSync(abs) ? "(exists)" : "(missing)"));
+        if (fs.existsSync(abs)) {
+          try {
+            const mod = await import(pathToFileURL(abs));
+            app = mod?.app || mod?.default?.app || mod?.default;
+            if (app && typeof app.fetch === "function") break;
+          } catch (e) {
+            tried.push("C-err:" + e.message);
+          }
+          try {
+            if (!app || typeof app.fetch !== "function") {
+              const mod2 = require(abs);
+              app = mod2?.app || mod2?.default?.app || mod2?.default || mod2;
+              if (app && typeof app.fetch === "function") break;
+            }
+          } catch (e) {
+            tried.push("C-cjs-err:" + e.message);
+          }
+        }
+      }
+    }
+
+    // ---- 方式 D（最后兜底，此时 exports 肯定已被构建补丁修好）：按包名 import ----
     if (!app || typeof app.fetch !== "function") {
-      tried.push("C:rootESM");
+      tried.push("D:rootESM");
       try {
         const pkg = await import("dailyhot-api");
         app = pkg?.app || pkg?.default?.app || pkg?.default;
       } catch (e) {
-        tried.push("C-err:" + e.message);
+        tried.push("D-err:" + e.message);
       }
-    }
-
-    // ---- 方式 D：包根 CommonJS require（最兜底）----
-    if (!app || typeof app.fetch !== "function") {
-      tried.push("D:rootCJS");
+      tried.push("E:rootCJS");
       try {
         const pkg = require("dailyhot-api");
         app = pkg?.app || pkg?.default?.app || pkg?.default || pkg;
       } catch (e) {
-        tried.push("D-err:" + e.message);
+        tried.push("E-err:" + e.message);
       }
     }
 
@@ -441,8 +486,9 @@ async function getDailyHotApp() {
           "已尝试: " + tried.join(" | "),
           "",
           "💡 解决：",
-          "  A. 检查 node_modules/dailyhot-api 是否存在，删除 node_modules 后重新 npm install",
-          "  B. 确保 Build 时执行了 patch-dailyhot-api.js，Vercel Build Command = npm run vercel-build",
+          "  A. 删除项目下 node_modules/dailyhot-api 后重新 npm install dailyhot-api",
+          "  B. 确认 Vercel Build Command = npm run vercel-build（会调用 patch-dailyhot-api.js 修正 exports）",
+          "  C. 本地在项目根目录执行 node patch-dailyhot-api.js 手动打一次补丁再 redeploy",
         ].join("\n")
       );
     }
