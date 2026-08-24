@@ -12,25 +12,27 @@ const require = createRequire(import.meta.url);
 
 // ============================================================
 // ⭐ Vercel 只读文件系统 0 号防线（全局、最先执行）：
-//   在任何业务代码、任何 import 之前就先执行，确保：
+//   在任何业务代码、任何 import 之前就先执行，100% 兜底 dailyhot-api 的 winston logger：
 //    1) 工作目录在 /tmp（唯一可写）
-//    2) /tmp/logs 目录存在
-//    3) fs.mkdirSync / fs.mkdir 全局拦截：任何只读路径（/var/task 等）下的 mkdir
-//       一律被重定向到 /tmp 下对应子目录（让 winston / dailyhot-api 所有写操作都成功）
-//   这一层 + 构建期 logger.js Proxy 拦截 = 双保险，winston 永远不会因为写失败崩溃
+//    2) /tmp/logs 目录预创建
+//    3) fs.mkdirSync / fs.mkdir 全局拦截：失败就 redirect 到 /tmp
+//    4) fs.createWriteStream 全局拦截：非 /tmp 路径一律 /tmp/logs/<basename>
+//    5) 【终极】winston 全局 wrap：transports.* 所有构造器 new 失败时返回带 log() 方法的 Mock
+//       实例（winston 内部只检查「有没有 log 方法」→ 永远通过，永不 Invalid transport）
+//   构建补丁只做字面量简单替换，不插入代码，避免语法冲突，
+//   真正的拦截全在这里，最先执行、覆盖所有模块加载。
 // ============================================================
 (() => {
   try {
     let safeTmp = "/tmp";
     try {
-      // 不用 top-level await，因为这里是同步 IIFE；直接 require('os') 反而简单
       const os = require("os");
       if (os && typeof os.tmpdir === "function") {
         const t = os.tmpdir();
         if (t && typeof t === "string") safeTmp = t;
       }
     } catch (_) {}
-
+    const safeNorm = String(safeTmp).split(path.sep).join("/");
     try {
       if (!fs.existsSync(safeTmp)) fs.mkdirSync(safeTmp, { recursive: true });
       const logDir = path.join(safeTmp, "logs");
@@ -38,21 +40,20 @@ const require = createRequire(import.meta.url);
     } catch (_) {}
     try { process.chdir(safeTmp); } catch (_) {}
 
-    // 全局拦截 fs.mkdirSync / fs.mkdir：任何失败自动重定向到 /tmp/<basename>
+    // ---------- 3) mkdir / mkdirSync 拦截 ----------
     const origMkdirSync = fs.mkdirSync.bind(fs);
     const origMkdir = fs.mkdir.bind(fs);
     function redirectToSafe(p) {
       const s = String(p || "").split(path.sep).join("/");
-      const safeNorm = safeTmp.split(path.sep).join("/");
       if (!s || s === safeNorm || s.indexOf(safeNorm + "/") === 0) return p;
       const base = path.basename(s) || "logs";
-      const candidate = path.join(safeTmp, base);
-      try { if (!fs.existsSync(candidate)) origMkdirSync(candidate, { recursive: true }); } catch (_) {}
-      return candidate;
+      const cand = path.join(safeTmp, base);
+      try { if (!fs.existsSync(cand)) origMkdirSync(cand, { recursive: true }); } catch (_) {}
+      return cand;
     }
     fs.mkdirSync = function (target, opts) {
       try { return origMkdirSync(target, opts); } catch (_) {
-        try { return origMkdirSync(redirectToSafe(target), opts); } catch (__) { /* swallow */ }
+        try { return origMkdirSync(redirectToSafe(target), opts); } catch (_2) { /* swallow */ }
       }
     };
     fs.mkdir = function (target, opts, cb) {
@@ -68,7 +69,120 @@ const require = createRequire(import.meta.url);
         try { return origMkdir(redirectToSafe(target), realOpts, done); } catch (e2) { return done(e2); }
       }
     };
-  } catch (_) {}
+
+    // ---------- 4) createWriteStream 拦截 ----------
+    const safeLogDir = path.join(safeTmp, "logs");
+    const origCreateWriteStream = fs.createWriteStream.bind(fs);
+    function safeStreamPath(p) {
+      if (!p) return p;
+      const s = String(p);
+      const norm = s.split(path.sep).join("/");
+      if (norm === safeNorm || norm.indexOf(safeNorm + "/") === 0 || norm.indexOf("file://") === 0) return p;
+      const base = path.basename(s) || "fallback.log";
+      return path.join(safeLogDir, base);
+    }
+    fs.createWriteStream = function (p, opts) {
+      try { return origCreateWriteStream(safeStreamPath(p), opts); } catch (_1) {
+        try { return origCreateWriteStream(path.join(safeLogDir, "fallback.log"), opts); } catch (_2) { return null; }
+      }
+    };
+
+    // ---------- 5) 全局 winston transports 构造器 wrap：永不 Invalid transport ----------
+    // 5a) Mock Transport（实现 winston 最小契约：有 log 方法 + EventEmitter API）
+    function makeMockTransport() {
+      const noop = function () {};
+      const mock = {
+        silent: true, level: "info", format: null,
+        log(info, cb) { try { if (typeof cb === "function") cb(null, true); } catch (_) {} return true; },
+        on() { return mock; },
+        once() { return mock; },
+        emit() { return true; },
+        addListener() { return mock; },
+        removeListener() { return mock; },
+        removeAllListeners() { return mock; },
+        setMaxListeners() { return mock; },
+        end() { noop(); },
+        close() { noop(); },
+        destroy() { noop(); },
+      };
+      return mock;
+    }
+    function wrapWinstonTransports(winstonExports) {
+      const w = (winstonExports && (winstonExports.default || winstonExports)) || winstonExports;
+      if (!w || !w.transports || w.__dailyhot_wrapped_all__) return;
+      const tp = w.transports;
+      const keys = Object.keys(tp);
+      for (let i = 0; i < keys.length; i++) {
+        const tk = keys[i];
+        const orig = tp[tk];
+        if (typeof orig !== "function" || orig.__dailyhot_wrapped__) continue;
+        function Wrapped() {
+          const args = Array.prototype.slice.call(arguments);
+          // 先按普通构造器 new 一次（用户层面最常用的方式）
+          try {
+            if (!(this instanceof Wrapped)) {
+              // 被当作普通函数调用，用 new 调原构造器
+              const F = Function.prototype.bind.apply(orig, [null].concat(args));
+              return new F();
+            }
+            const r = orig.apply(this, args);
+            if (r && typeof r === "object") return r;
+            return this;
+          } catch (_1) {
+            try {
+              const F = Function.prototype.bind.apply(orig, [null].concat(args));
+              return new F();
+            } catch (_2) {
+              // 任何方式都失败 → 返回 Mock（有 log 方法）
+              return makeMockTransport();
+            }
+          }
+        }
+        Wrapped.prototype = Object.create(orig.prototype || {});
+        Wrapped.prototype.constructor = Wrapped;
+        Wrapped.__dailyhot_wrapped__ = true;
+        tp[tk] = Wrapped;
+      }
+      w.__dailyhot_wrapped_all__ = true;
+    }
+    // 5b) 勾住 Module._resolveFilename：winston 被加载后立刻 wrap transports
+    try {
+      const Module = require("module");
+      if (Module && Module._resolveFilename && !Module._resolveFilename.__dailyhot_hooked__) {
+        const origResolve = Module._resolveFilename;
+        Module._resolveFilename = function (request, parent, isMain, options) {
+          const filename = origResolve.call(this, request, parent, isMain, options);
+          try {
+            if (filename && typeof filename === "string") {
+              const norm = filename.split(path.sep).join("/");
+              if (/winston\/(?:lib\/)?winston\.js$|winston[\\/]index\.js$/.test(norm)) {
+                process.nextTick(function () {
+                  try { const w = require(filename); wrapWinstonTransports(w); } catch (_) {}
+                });
+                setImmediate(function () {
+                  try { const w = require(filename); wrapWinstonTransports(w); } catch (_) {}
+                });
+                // 最后兜底：宏任务 queue 末尾再 wrap 一次（winston 异步初始化）
+                setTimeout(function () {
+                  try { const w = require(filename); wrapWinstonTransports(w); } catch (_) {}
+                }, 50);
+              }
+            }
+          } catch (_) {}
+          return filename;
+        };
+        Module._resolveFilename.__dailyhot_hooked__ = true;
+      }
+    } catch (_) {}
+    // 5c) 现在主动尝试 require('winston') 并 wrap（dailyhot-api 里可能已经缓存过了）
+    try {
+      const w = require("winston");
+      wrapWinstonTransports(w);
+    } catch (_) {}
+  } catch (_outer) {
+    // 整个 0 号防线任何异常都吞掉，绝不影响业务
+    try { if (console && console.warn) console.warn("[dailyhot-0th-defense] skipped (non-fatal):", String(_outer && _outer.message || _outer).slice(0, 120)); } catch (_) {}
+  }
 })();
 
 // ============================================================

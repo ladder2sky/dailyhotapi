@@ -123,14 +123,13 @@ try {
   }
 
   // ============================================================
-  // 修复 2（关键）：改写 dist/utils/logger.js 源码
-  //   ⭐ 2026-08-24 改为「注入式通用拦截器」（不再靠正则匹配代码模板，避免 return null 过滤没命中导致 Invalid transport）：
-  //     a) 在 logger.js 文件内所有 import 之后、业务代码之前注入一段 IIFE 拦截器：
-  //        - 拦截 winston.transports 的所有构造器（File / DailyRotateFile / Http / Console ...）
-  //        - 任何 new 失败 -> 自动返回【带 log() 方法的 Mock Transport 实例】
-  //          （winston 校验 transports 只检查「有 log 方法」，Mock 满足=校验通过，永不抛 Invalid transport）
-  //        - 顺带拦截 fs.createWriteStream(path)：任何不在 /tmp 下的路径一律重定向到 /tmp/logs/<basename>
-  //     b) 构建补丁只负责把拦截器注入，后续 dailyhot-api 内部怎么写 new 都不关我们事，100% 覆盖。
+  // 修复 2（兜底）：不碰 dailyhot-api 任何源码的 JS 内容（零语法错误风险）
+  //   ⚠️ 2026-08-24 最终方案：
+  //     真正的 winston 拦截 100% 放在 index.js 顶层 0 号防线（运行时 monkey-patch），
+  //     构建补丁 patch-dailyhot-api.js 这里只做一件零风险的事：
+  //       - 尝试把 dailyhot-api 自己包目录里的 logs 文件夹软链/复制到 /tmp（如果可写）
+  //       - 以及（最重要）把 dist/utils/logger.js 里所有 `./logs`、`logs` 字面量替换成 `/tmp/logs`
+  //       - 不插入任何新 JS 代码，只做简单字符串替换，不会改变 AST/语法
   // ============================================================
   const loggerPaths = [
     path.join(pkgRoot, "dist", "utils", "logger.js"),
@@ -140,159 +139,26 @@ try {
   for (const loggerFile of loggerPaths) {
     if (!fs.existsSync(loggerFile)) continue;
     let code = fs.readFileSync(loggerFile, "utf-8");
-
-    // 跳过已打补丁（避免重复替换）
-    if (code.includes("__DAILYHOT_PATCHED_INJECTOR__")) {
-      console.log(`ℹ️ [2/2] ${path.relative(pkgRoot, loggerFile)} 已打过注入式补丁，跳过`);
+    if (code.includes("__DAILYHOT_LOG_PATCHED_LITERAL__")) {
+      console.log(`ℹ️ [2/2] ${path.relative(pkgRoot, loggerFile)} 已替换 logs 字面量，跳过`);
       patchedLogger = true;
       break;
     }
-
     const before = code;
-
-    // 注入式拦截器代码（以字符串形式插入 logger.js）
-    const INJECTOR = `
-/* __DAILYHOT_PATCHED_INJECTOR__ START (Vercel 只读文件系统通用拦截器) */
-(() => {
-  try {
-    const fs = require('fs');
-    const path = require('path');
-    const os = require('os');
-    const safeTmp = (os && os.tmpdir && os.tmpdir()) || '/tmp';
-    try { if (safeTmp && !fs.existsSync(safeTmp)) fs.mkdirSync(safeTmp, { recursive: true }); } catch (_) {}
-    const safeLogDir = path.join(safeTmp, 'logs');
-    try { if (!fs.existsSync(safeLogDir)) fs.mkdirSync(safeLogDir, { recursive: true }); } catch (_) {}
-
-    // 1) fs.createWriteStream 拦截：路径不在 /tmp 下一律指向 /tmp/logs/<basename>
-    const origCreateWriteStream = fs.createWriteStream.bind(fs);
-    function safePath(p) {
-      if (!p) return p;
-      const s = String(p);
-      const norm = s.split(path.sep).join('/');
-      const safeN = String(safeTmp).split(path.sep).join('/');
-      if (norm === safeN || norm.indexOf(safeN + '/') === 0 || norm.startsWith('file://')) return p;
-      const base = path.basename(s) || 'fallback.log';
-      return path.join(safeLogDir, base);
-    }
-    fs.createWriteStream = function (p, opts) {
-      try { return origCreateWriteStream(safePath(p), opts); } catch (_) {
-        try { return origCreateWriteStream(path.join(safeLogDir, 'fallback.log'), opts); } catch (_2) { return null; }
-      }
-    };
-
-    // 2) Mock Transport：实现 winston 要求的最小契约（有 log 方法 + 基本 EventEmitter API）
-    function makeMockTransport(name) {
-      const noop = () => {};
-      const mock = {
-        silent: true, level: 'info', format: null,
-        log(info, cb) { try { if (typeof cb === 'function') cb(null, true); } catch (_) {} return true; },
-        on() { return mock; },
-        once() { return mock; },
-        emit() { return true; },
-        addListener() { return mock; },
-        removeListener() { return mock; },
-        removeAllListeners() { return mock; },
-        setMaxListeners() { return mock; },
-        end() { noop(); },
-        close() { noop(); },
-        destroy() { noop(); },
-      };
-      return mock;
-    }
-
-    // 3) 全局 Hook Module._resolveFilename：winston 首次被 require 之后立刻 wrap transports
-    const Module = require('module');
-    const origResolve = Module._resolveFilename;
-    function wrapWinstonTransportsOnce() {
-      try {
-        const keys = Object.keys(require.cache);
-        for (let i = 0; i < keys.length; i++) {
-          const k = keys[i];
-          const norm = k.split(path.sep).join('/');
-          if (!/winston\/(lib\/)?winston\.js|winston[\\/]index\.js/.test(norm)) continue;
-          const cached = require.cache[k] && require.cache[k].exports;
-          const w = (cached && (cached.default || cached)) || cached;
-          if (!w || !w.transports || w.__dailyhot_wrapped_all__) continue;
-          const tp = w.transports;
-          Object.keys(tp).forEach(function (tk) {
-            const orig = tp[tk];
-            if (typeof orig !== 'function' || orig.__dailyhot_wrapped__) return;
-            function Wrapped(...args) {
-              try { return new orig(...args); } catch (e) {
-                try { if (console && console.warn) console.warn('[dailyhot-api logger] transport.' + tk + ' new() 失败，降级 Mock：', String(e && e.message || e).slice(0, 80)); } catch (_) {}
-                return makeMockTransport(tk);
-              }
-            }
-            Wrapped.prototype = orig.prototype || {};
-            Wrapped.__dailyhot_wrapped__ = true;
-            tp[tk] = Wrapped;
-          });
-          w.__dailyhot_wrapped_all__ = true;
-        }
-      } catch (_) {}
-    }
-    Module._resolveFilename = function (request, parent, isMain, options) {
-      const filename = origResolve.call(this, request, parent, isMain, options);
-      try {
-        if (filename && typeof filename === 'string') {
-          const norm = filename.split(path.sep).join('/');
-          if (/winston\/(lib\/)?winston\.js/.test(norm)) {
-            process.nextTick(wrapWinstonTransportsOnce);
-            setImmediate(wrapWinstonTransportsOnce);
-          }
-        }
-      } catch (_) {}
-      return filename;
-    };
-    // 保险：拦截器运行时再尝试主动 require('winston') wrap 一次
-    try {
-      const w = require('winston');
-      if (w && w.transports) {
-        const tp = w.transports;
-        Object.keys(tp).forEach(function (tk) {
-          const orig = tp[tk];
-          if (typeof orig !== 'function' || orig.__dailyhot_wrapped__) return;
-          function Wrapped(...args) {
-            try { return new orig(...args); } catch (_e) { return makeMockTransport(tk); }
-          }
-          Wrapped.prototype = orig.prototype || {};
-          Wrapped.__dailyhot_wrapped__ = true;
-          tp[tk] = Wrapped;
-        });
-      }
-    } catch (_) {}
-  } catch (_) { /* 拦截器自身任何异常一律吞掉，不能影响业务 logger 初始化 */ }
-})();
-/* __DAILYHOT_PATCHED_INJECTOR__ END */
-`;
-
-    // 找插入位置：所有 import 语句之后
-    const importRe = /^import\s+(?:[^;\n]+?)\s+from\s+["'`][^"'`]+["'`]\s*;?\s*$|^import\s*["'`][^"'`]+["'`]\s*;?\s*$/gm;
-    let insertAt = 0;
-    let m;
-    while ((m = importRe.exec(code)) !== null) insertAt = m.index + m[0].length;
-    const newCode = insertAt > 0
-      ? code.slice(0, insertAt) + "\n" + INJECTOR + "\n" + code.slice(insertAt)
-      : INJECTOR + "\n" + code;
-
-    // 保底再替换字面量 'logs' / "./logs"（拦截器没生效时的最后防线）
-    let code2 = newCode;
-    try {
-      code2 = code2.replace(
-        /(['"`])\.\/logs\1/g,
-        (q) => "(require('path').join(require('os').tmpdir() || '/tmp', 'logs'))"
-      );
-    } catch (_) {}
-
-    if (code2 !== before) {
-      fs.writeFileSync(loggerFile, code2, "utf-8");
-      console.log(`✅ [2/2] 已注入通用拦截器 ${path.relative(pkgRoot, loggerFile)}（任何 new transports.X 失败 -> Mock，永不抛 Invalid transport）`);
+    // 仅做最保守的字面量替换（硬编码 /tmp/logs 最安全，不会用到任何未定义变量）
+    // `./logs` 或 `logs` 但不包含 `/logs`（避免误伤 http://foo/logs）
+    code = code.replace(/(['"`])(\.\/)?logs\1/g, (_m, q) => `${q}/tmp/logs${q} /* __DAILYHOT_LOG_PATCHED_LITERAL__ */`);
+    // dirname: 'logs'（对象里单独的字段，字符串不包含路径的）
+    code = code.replace(/(\bdirname\s*:\s*)(['"`])logs\2/g, (_m, pre, q) => `${pre}${q}/tmp/logs${q} /* __DAILYHOT_LOG_PATCHED_LITERAL__ */`);
+    if (code !== before) {
+      fs.writeFileSync(loggerFile, code, "utf-8");
+      console.log(`✅ [2/2] ${path.relative(pkgRoot, loggerFile)} logs 字面量已替换为 /tmp/logs（仅纯字面量替换，未插入任何新语句）`);
       patchedLogger = true;
       break;
     }
   }
   if (!patchedLogger) {
-    console.log("ℹ️ [2/2] 未找到 logger.js 或无需修改，跳过 logger 补丁");
+    console.log("ℹ️ [2/2] 未找到 logger.js 或字面量无需替换，跳过（index.js 顶层 0 号防线仍会生效）");
   }
 } catch (e) {
   if (e.code === "MODULE_NOT_FOUND") {
