@@ -6,6 +6,9 @@
   "license": "MIT",
   "author": "imsyy",
   "main": "index.js",
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
     "start": "node start.js",
     "patch": "node patch-dailyhot-api.js",
