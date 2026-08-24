@@ -74,6 +74,236 @@ const fetchText = (url, timeoutMs = 6000) => {
 };
 
 // ============================================================
+// 2.5. 通用 RSS 拉取 + 解析（新增：BBC/Reuters/FT/Bloomberg/CNBC 等海外新闻源）
+// ============================================================
+/**
+ * 从 RSS 2.0 / Atom XML 中抽取 (title, link, pubDate, description) 条目列表
+ * 为了避免引入三方依赖（fast-xml-parser 等），这里用简单稳妥的正则抽取：
+ *   - RSS 2.0:  <item>...</item>  内找 <title> / <link> / <pubDate> / <description>
+ *   - Atom 1.0: <entry>...</entry> 内找 <title> / <link href="..."> / <updated> / <summary>
+ * @param {string} xml RSS/Atom 源文本
+ * @returns {Array<{idx:number,title:string,link:string,date:string,desc:string}>}
+ */
+function parseRssXml(xml) {
+  const items = [];
+  const pushItem = (it) => {
+    if (it && (it.title || it.link)) items.push(it);
+  };
+  // 先清理 CDATA <![CDATA[ xxx ]]>
+  const text = String(xml || "").replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, (_m, g1) => String(g1 || ""));
+  // 1) RSS 2.0 <item>
+  const rssRe = /<item>([\s\S]*?)<\/item>/gi;
+  let m;
+  let idx = 0;
+  while ((m = rssRe.exec(text))) {
+    const chunk = m[1] || "";
+    const title = (chunk.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || "";
+    let link = (chunk.match(/<link[^>]*>([\s\S]*?)<\/link>/i) || [])[1] || "";
+    if (!link) link = (chunk.match(/<link\s+[^>]*?href="([^"]+)"/i) || [])[1] || "";
+    const date =
+      (chunk.match(/<pubDate[^>]*>([\s\S]*?)<\/pubDate>/i) || [])[1] ||
+      (chunk.match(/<dc:date[^>]*>([\s\S]*?)<\/dc:date>/i) || [])[1] ||
+      "";
+    const desc =
+      (chunk.match(/<description[^>]*>([\s\S]*?)<\/description>/i) || [])[1] ||
+      (chunk.match(/<content:encoded[^>]*>([\s\S]*?)<\/content:encoded>/i) || [])[1] ||
+      "";
+    pushItem({ idx: ++idx, title: sanitizeHtml(title), link: String(link).trim(), date: String(date).trim(), desc: sanitizeHtml(desc, 220) });
+  }
+  // 2) Atom <entry>
+  const atomRe = /<entry>([\s\S]*?)<\/entry>/gi;
+  while ((m = atomRe.exec(text))) {
+    const chunk = m[1] || "";
+    const title = (chunk.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || "";
+    const link = (chunk.match(/<link\s+[^>]*?href="([^"]+)"/i) || [])[1] || "";
+    const date =
+      (chunk.match(/<updated[^>]*>([\s\S]*?)<\/updated>/i) || [])[1] ||
+      (chunk.match(/<published[^>]*>([\s\S]*?)<\/published>/i) || [])[1] ||
+      "";
+    const desc =
+      (chunk.match(/<summary[^>]*>([\s\S]*?)<\/summary>/i) || [])[1] ||
+      (chunk.match(/<content[^>]*>([\s\S]*?)<\/content>/i) || [])[1] ||
+      "";
+    pushItem({ idx: ++idx, title: sanitizeHtml(title), link: String(link).trim(), date: String(date).trim(), desc: sanitizeHtml(desc, 220) });
+  }
+  return items;
+}
+/**
+ * 清理 HTML 标签、压缩多余空白、截断（用于 desc / title 的 RSS 清洗）
+ */
+function sanitizeHtml(s, maxLen = 0) {
+  let t = String(s || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (maxLen && t.length > maxLen) t = t.slice(0, maxLen) + "...";
+  return t;
+}
+/**
+ * 从 RSS 源拉取并转换为符合 dailyhot-api 标准的 data 条目列表
+ * @param {string} rssUrl RSS 源 URL
+ * @param {string} hotLabel 每一行 hot 字段默认显示（例如 "BBC World" / "Reuters Business"）
+ * @param {number} limit 最多多少条
+ */
+async function fetchRssToNewsItems(rssUrl, hotLabel = "News", limit = 30) {
+  const xml = await fetchText(rssUrl, 12000);
+  const parsed = parseRssXml(xml);
+  const list = parsed.slice(0, limit).map((it, i) => {
+    return {
+      id: String(i + 1),
+      title: it.title || "(无标题)",
+      url: it.link || "#",
+      mobileUrl: it.link || "#",
+      hot: it.date ? `${hotLabel} · ${it.date.slice(0, 25)}` : hotLabel,
+      desc: it.desc || hotLabel,
+    };
+  });
+  return list;
+}
+
+// ============================================================
+// 2.8. 海外权威新闻源配置
+//   按您偏好：国际局势 / 经济 / 科技 三类。均使用官方公开 RSS 地址。
+// ============================================================
+const GLOBAL_NEWS_FEEDS = {
+  bbc_world: {
+    title: "BBC World（国际局势）",
+    name: "bbc-world",
+    type: "国际局势",
+    description: "BBC News 世界新闻：全球重大事件、地缘政治、冲突与外交报道",
+    url: "https://feeds.bbci.co.uk/news/world/rss.xml",
+  },
+  bbc_business: {
+    title: "BBC Business（经济）",
+    name: "bbc-business",
+    type: "经济",
+    description: "BBC 商业新闻：全球经济、金融市场、央行政策与公司动态",
+    url: "https://feeds.bbci.co.uk/news/business/rss.xml",
+  },
+  bbc_tech: {
+    title: "BBC Technology（科技）",
+    name: "bbc-tech",
+    type: "科技",
+    description: "BBC 科技新闻：AI、芯片、互联网巨头、监管与消费电子",
+    url: "https://feeds.bbci.co.uk/news/technology/rss.xml",
+  },
+  reuters_world: {
+    title: "Reuters World（国际局势）",
+    name: "reuters-world",
+    type: "国际局势",
+    description: "路透社世界新闻：中立、快速、深度的全球重大事件报道",
+    url: "https://www.reutersagency.com/feed/?best-topics=world&post_type=best",
+    fallback: "https://feeds.reuters.com/Reuters/worldNews",
+  },
+  reuters_business: {
+    title: "Reuters Business（经济）",
+    name: "reuters-business",
+    type: "经济",
+    description: "路透社财经：全球市场、宏观经济、央行、并购与公司业绩",
+    url: "https://www.reutersagency.com/feed/?best-topics=business-finance&post_type=best",
+    fallback: "https://feeds.reuters.com/reuters/businessNews",
+  },
+  reuters_tech: {
+    title: "Reuters Technology（科技）",
+    name: "reuters-tech",
+    type: "科技",
+    description: "路透社科技：硅谷、AI、半导体、平台监管与创业公司动态",
+    url: "https://www.reutersagency.com/feed/?best-topics=tech&post_type=best",
+    fallback: "https://feeds.reuters.com/reuters/technologyNews",
+  },
+  ft_economy: {
+    title: "FT Global Economy（经济 · 金融时报）",
+    name: "ft-economy",
+    type: "经济",
+    description: "金融时报全球经济：专业视角看全球经济、政策与市场",
+    url: "https://www.ft.com/global-economy?format=rss",
+  },
+  ft_markets: {
+    title: "FT Markets（经济 · 市场）",
+    name: "ft-markets",
+    type: "经济",
+    description: "金融时报市场：股票、债券、外汇、大宗商品行情与分析",
+    url: "https://www.ft.com/markets?format=rss",
+  },
+  bloomberg_markets: {
+    title: "Bloomberg（经济 · 彭博市场）",
+    name: "bloomberg-markets",
+    type: "经济",
+    description: "彭博市场：华尔街、利率、股市、债市与全球宏观",
+    url: "https://feeds.bloomberg.com/markets/news.rss",
+  },
+  cnbc_top: {
+    title: "CNBC Top（经济 · 财经头条）",
+    name: "cnbc-top",
+    type: "经济",
+    description: "CNBC 财经头条：美股、美联储、公司财报与经济数据",
+    url: "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+  },
+  economist_fe: {
+    title: "The Economist Finance（经济 · 经济学人）",
+    name: "economist-fe",
+    type: "经济",
+    description: "经济学人财经：长周期、大视角的全球经济与政策分析",
+    url: "https://www.economist.com/finance-and-economics/rss.xml",
+  },
+  economist_intl: {
+    title: "The Economist International（国际局势 · 经济学人）",
+    name: "economist-intl",
+    type: "国际局势",
+    description: "经济学人国际：大国关系、全球治理与地缘观察",
+    url: "https://www.economist.com/international/rss.xml",
+  },
+};
+
+// ============================================================
+// 2.9. 海外 RSS 路由快速构建器
+// ============================================================
+/**
+ * 构建一个海外新闻路由的统一处理函数（带主源 + fallback 源）
+ * @param {keyof typeof GLOBAL_NEWS_FEEDS} feedKey
+ */
+function buildRssRoute(feedKey) {
+  const meta = GLOBAL_NEWS_FEEDS[feedKey];
+  /** @type {(sendJson: any) => Promise<void>} */
+  return async (sendJson) => {
+    const urls = [meta.url];
+    if (meta.fallback) urls.push(meta.fallback);
+    let lastErr = null;
+    for (const u of urls) {
+      try {
+        const list = await fetchRssToNewsItems(u, meta.title, 30);
+        if (!list || list.length === 0) throw new Error("empty list");
+        const nowISO = new Date().toISOString();
+        return sendJson(200, {
+          code: 200,
+          name: meta.name,
+          title: meta.title,
+          type: meta.type,
+          description: meta.description,
+          total: list.length,
+          updateTime: nowISO,
+          fromCache: false,
+          data: list,
+        });
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    return sendJson(500, {
+      code: 500,
+      message: `${meta.title} 拉取失败`,
+      error: (lastErr && lastErr.message) || String(lastErr || ""),
+    });
+  };
+}
+
+// ============================================================
 // 2. 惰性加载 dailyhot-api 内部的 Hono app
 //    - 首次请求加载，后面复用缓存
 //    - 优先用 createRequire + 绝对路径，绕过 package.json exports 限制
@@ -410,7 +640,30 @@ export default async function handler(req, res) {
       }
     }
 
-    // -------------------- 3. 兜底：dailyhot-api 内置接口（/bilibili /weibo /...）--------------------
+    // -------------------- 3. 海外权威新闻路由（共 12 条，国际局势/经济/科技） --------------------
+    const RSS_ROUTE_MAP = {
+      "/bbc-world":         "bbc_world",
+      "/bbc-business":      "bbc_business",
+      "/bbc-tech":          "bbc_tech",
+      "/reuters-world":     "reuters_world",
+      "/reuters-business":  "reuters_business",
+      "/reuters-tech":      "reuters_tech",
+      "/ft-economy":        "ft_economy",
+      "/ft-markets":        "ft_markets",
+      "/bloomberg-markets": "bloomberg_markets",
+      "/cnbc-top":          "cnbc_top",
+      "/economist-fe":      "economist_fe",
+      "/economist-intl":    "economist_intl",
+    };
+    for (const [routePath, feedKey] of Object.entries(RSS_ROUTE_MAP)) {
+      if (url.startsWith(routePath)) {
+        const handle = buildRssRoute(feedKey);
+        await handle(sendJson);
+        return;
+      }
+    }
+
+    // -------------------- 4. 兜底：dailyhot-api 内置接口（/bilibili /weibo /...）--------------------
     try {
       const app = await getDailyHotApp();
       const webReq = toWebRequest(req);
