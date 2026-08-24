@@ -54,6 +54,9 @@ server.listen(PORT, () => {
   console.log(`   - HackerNews:   http://localhost:${PORT}/hackernews`);
   console.log(`   - Bilibili:     http://localhost:${PORT}/bilibili`);
   console.log(`   - Weibo:        http://localhost:${PORT}/weibo`);
+  console.log(`   - BBC World:    http://localhost:${PORT}/bbc-world`);
+  console.log(`   - Reuters Biz:  http://localhost:${PORT}/reuters-business`);
+  console.log(`   - FT Economy:   http://localhost:${PORT}/ft-economy`);
   console.log(`   - 全部路由:     http://localhost:${PORT}/all`);
   console.log("========================================");
   console.log("");

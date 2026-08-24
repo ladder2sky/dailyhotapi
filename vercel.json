@@ -1,28 +1,25 @@
 {
-  "version": 3,
-  "framework": null,
-  "installCommand": "npm install",
-  "buildCommand": "npm run vercel-build",
-  "functions": {
-    "index.js": {
-      "runtime": "@vercel/node@3"
-    }
-  },
-  "rewrites": [
+  "version": 2,
+  "name": "dailyhotapi",
+  "builds": [
     {
-      "source": "/(.*)",
-      "destination": "/index.js"
+      "src": "index.js",
+      "use": "@vercel/node@3",
+      "config": {
+        "includeFiles": "node_modules/**"
+      }
     }
   ],
-  "headers": [
+  "routes": [
     {
-      "source": "/(.*)",
-      "headers": [
-        { "key": "Access-Control-Allow-Credentials", "value": "true" },
-        { "key": "Access-Control-Allow-Origin", "value": "*" },
-        { "key": "Access-Control-Allow-Methods", "value": "GET,OPTIONS,PATCH,DELETE,POST,PUT" },
-        { "key": "Access-Control-Allow-Headers", "value": "X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version" }
-      ]
+      "src": "/(.*)",
+      "dest": "/index.js",
+      "headers": {
+        "Access-Control-Allow-Credentials": "true",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET,OPTIONS,PATCH,DELETE,POST,PUT",
+        "Access-Control-Allow-Headers": "X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version"
+      }
     }
   ]
 }
