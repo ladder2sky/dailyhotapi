@@ -315,7 +315,7 @@ export default async function handler(req, res) {
           "https://hacker-news.firebaseio.com/v0/topstories.json"
         );
         const topIds = JSON.parse(rawData);
-        const sliceIds = Array.isArray(topIds) ? topIds.slice(0, 20) : [];
+        const sliceIds = Array.isArray(topIds) ? topIds.slice(0, 30) : [];
         const items = await Promise.all(
           sliceIds.map(async (id) => {
             try {
@@ -331,17 +331,24 @@ export default async function handler(req, res) {
         const list = items
           .filter(Boolean)
           .map((item) => ({
-            id: item.id,
+            id: String(item.id),
             title: item.title || "",
             url: item.url || `https://news.ycombinator.com/item?id=${item.id}`,
-            hot: item.score || 0,
             mobileUrl:
               item.url || `https://news.ycombinator.com/item?id=${item.id}`,
+            hot: (item.score || 0) + " 热度",
+            desc: item.type || "story",
           }));
+        const nowISO = new Date().toISOString();
         return sendJson(200, {
           code: 200,
-          message: "获取成功",
+          name: "hackernews",
           title: "Hacker News",
+          type: "热门榜",
+          description: "科技、编程与创业新闻聚合",
+          total: list.length,
+          updateTime: nowISO,
+          fromCache: false,
           data: list,
         });
       } catch (e) {
@@ -357,7 +364,7 @@ export default async function handler(req, res) {
     if (url.startsWith("/reddit")) {
       try {
         const xmlData = await fetchText(
-          "https://www.reddit.com/r/all/.rss?limit=20",
+          "https://www.reddit.com/r/all/.rss?limit=30",
           10000
         );
         const entries = [
@@ -365,7 +372,7 @@ export default async function handler(req, res) {
             /<entry>[\s\S]*?<title>([\s\S]*?)<\/title>[\s\S]*?<link href="([^"]+)"/g
           ),
         ];
-        const list = entries.slice(0, 20).map((match, idx) => {
+        const list = entries.slice(0, 30).map((match, idx) => {
           const title = (match[1] || "")
             .replace(/&lt;/g, "<")
             .replace(/&gt;/g, ">")
@@ -374,17 +381,24 @@ export default async function handler(req, res) {
             .replace(/&amp;/g, "&");
           const href = match[2] || "";
           return {
-            id: idx + 1,
+            id: String(idx + 1),
             title,
             url: href,
-            hot: "Hot",
             mobileUrl: href,
+            hot: "Hot",
+            desc: "Reddit r/all",
           };
         });
+        const nowISO = new Date().toISOString();
         return sendJson(200, {
           code: 200,
-          message: "获取成功",
+          name: "reddit",
           title: "Reddit",
+          type: "热门榜",
+          description: "The front page of the internet",
+          total: list.length,
+          updateTime: nowISO,
+          fromCache: false,
           data: list,
         });
       } catch (e) {
