@@ -11,6 +11,67 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 
 // ============================================================
+// ⭐ Vercel 只读文件系统 0 号防线（全局、最先执行）：
+//   在任何业务代码、任何 import 之前就先执行，确保：
+//    1) 工作目录在 /tmp（唯一可写）
+//    2) /tmp/logs 目录存在
+//    3) fs.mkdirSync / fs.mkdir 全局拦截：任何只读路径（/var/task 等）下的 mkdir
+//       一律被重定向到 /tmp 下对应子目录（让 winston / dailyhot-api 所有写操作都成功）
+//   这一层 + 构建期 logger.js Proxy 拦截 = 双保险，winston 永远不会因为写失败崩溃
+// ============================================================
+(() => {
+  try {
+    let safeTmp = "/tmp";
+    try {
+      // 不用 top-level await，因为这里是同步 IIFE；直接 require('os') 反而简单
+      const os = require("os");
+      if (os && typeof os.tmpdir === "function") {
+        const t = os.tmpdir();
+        if (t && typeof t === "string") safeTmp = t;
+      }
+    } catch (_) {}
+
+    try {
+      if (!fs.existsSync(safeTmp)) fs.mkdirSync(safeTmp, { recursive: true });
+      const logDir = path.join(safeTmp, "logs");
+      if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+    } catch (_) {}
+    try { process.chdir(safeTmp); } catch (_) {}
+
+    // 全局拦截 fs.mkdirSync / fs.mkdir：任何失败自动重定向到 /tmp/<basename>
+    const origMkdirSync = fs.mkdirSync.bind(fs);
+    const origMkdir = fs.mkdir.bind(fs);
+    function redirectToSafe(p) {
+      const s = String(p || "").split(path.sep).join("/");
+      const safeNorm = safeTmp.split(path.sep).join("/");
+      if (!s || s === safeNorm || s.indexOf(safeNorm + "/") === 0) return p;
+      const base = path.basename(s) || "logs";
+      const candidate = path.join(safeTmp, base);
+      try { if (!fs.existsSync(candidate)) origMkdirSync(candidate, { recursive: true }); } catch (_) {}
+      return candidate;
+    }
+    fs.mkdirSync = function (target, opts) {
+      try { return origMkdirSync(target, opts); } catch (_) {
+        try { return origMkdirSync(redirectToSafe(target), opts); } catch (__) { /* swallow */ }
+      }
+    };
+    fs.mkdir = function (target, opts, cb) {
+      const callback = typeof opts === "function" ? opts : cb;
+      const realOpts = typeof opts === "function" ? undefined : opts;
+      const done = function (err, res) { if (typeof callback === "function") callback(err, res); };
+      try {
+        return origMkdir(target, realOpts, function (err, res) {
+          if (!err) return done(null, res);
+          try { return origMkdir(redirectToSafe(target), realOpts, done); } catch (e2) { return done(e2); }
+        });
+      } catch (e) {
+        try { return origMkdir(redirectToSafe(target), realOpts, done); } catch (e2) { return done(e2); }
+      }
+    };
+  } catch (_) {}
+})();
+
+// ============================================================
 // 1. 原生 HTTP/HTTPS 请求封装（用于 Reddit / HackerNews）
 //    - 跟随 3xx 自动重定向
 //    - 6 秒超时
